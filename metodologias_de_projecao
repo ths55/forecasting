@@ -1,0 +1,444 @@
+%pip install pystan==2.19.1.1
+%pip install convertdate
+%pip install prophet
+import pandas as pd
+import numpy as np
+import scipy as sp
+import matplotlib.pyplot as plt
+import datetime
+import re
+from scipy import stats
+from prophet import Prophet
+# Remove mensagens desnecessárias
+import logging
+logger = spark._jvm.org.apache.log4j
+logging.getLogger("py4j.java_gateway").setLevel(logging.ERROR)
+def include_sep_date_cols(this_df):
+  """Inclui dados de 'ano', 'ano-mes', 'mes' e 'dia-da-semana' para fins de agrupamento"""
+  try:
+    this_df['ano-mes'] = this_df['date'].apply(lambda x: str(x).split('-')[0] + '-' + str(x).split('-')[1] if not pd.isna(x) else None)
+  except:
+    pass
+  try:
+    this_df['dia-da-semana'] = this_df['date'].apply(lambda x: x.isoweekday() if not pd.isna(x) else None)
+  except:
+    pass
+  try:
+    this_df['dia-do-mes'] = this_df['date'].apply(lambda x: str(x).split('-')[2] if not pd.isna(x) else None)
+  except:
+    pass
+  this_df['ano'] = this_df['ano-mes'].apply(lambda x: str(x).split('-')[0] if not pd.isna(x) else None)
+  this_df['mes'] = this_df['ano-mes'].apply(lambda x: str(x).split('-')[1] if not pd.isna(x) else None)
+  
+  return this_df
+
+# Funções de plot
+def plot_chart(this_df, var, x_col):
+  plt.rcParams["figure.figsize"] = (50,10)
+
+  fig, ax = plt.subplots()
+  channel_title = this_df['channel_title'].max()
+  
+  ax.set_title(f"{var} {channel_title}")
+  ax.bar(this_df[x_col], this_df[var])
+
+  display(fig)
+
+def plot_charts_per_channel(this_df, channel_id):
+  print(this_df[this_df['channel_id'] == channel_id]['channel_title'].max())
+  
+  # Plota todos os dados
+  plot_chart(this_df[this_df['channel_id'] == channel_id], 'views', 'date')
+  
+  # Plota apenas 2022
+  plot_chart(this_df[(this_df['channel_id'] == channel_id) & (this_df['date'].astype(str) > '2021-12-31')], 'views', 'date')
+  
+  # Plota março até hoje
+  plot_chart(this_df[(this_df['channel_id'] == channel_id) & (this_df['date'].astype(str) > '2022-02-28')], 'views', 'date')
+
+
+def plot_all(this_df):
+  for channel_id in this_df['channel_id'].unique():
+    plot_charts_per_channel(this_df, channel_id)
+
+def plot_real_vs_predicted(df_real, df_predict, var_col, title=''):
+  plt.rcParams["figure.figsize"] = (50,10)
+  
+  df_real.sort_values(by=['date'], inplace=True)
+  df_predict.sort_values(by=['date'], inplace=True)
+
+  fig, ax = plt.subplots()
+  
+  if title != '':
+    ax.set_title(f"{var_col} {title}")
+  
+  ax.bar(df_real['date'], df_real[var_col], label='real')
+  ax.plot(df_predict['date'], df_predict[var_col], label='predict', color='red', linewidth=10)
+  ax.legend() 
+
+  display(fig)
+
+#Funções de análise
+def shapiro_normal_distribution_test(this_df, var_col):
+  return stats.shapiro(this_df[var_col])
+
+def min_max_std_ratio(this_df, var_col, group_cols):
+  return this_df.groupby(group_cols).std().max()[0] / this_df.groupby(group_cols).std().min()[0]
+
+def anova(this_df, var, group_cols):
+  # Create ANOVA backbone table
+  data = [['Between Groups', '', '', '', '', '', ''], ['Within Groups', '', '', '', '', '', ''], ['Total', '', '', '', '', '', '']] 
+  anova_table = pd.DataFrame(data, columns = ['Source of Variation', 'SS', 'df', 'MS', 'F', 'P-value', 'F crit']) 
+  anova_table.set_index('Source of Variation', inplace = True)
+
+  # calculate SSTR and update anova table
+  x_bar = this_df[var].mean()
+  SSTR = this_df.groupby(group_cols).count() * (this_df.groupby(group_cols).mean() - x_bar)**2
+  anova_table['SS']['Between Groups'] = SSTR[var].sum()
+
+  # calculate SSE and update anova table
+  SSE = (sample_df.groupby(group_cols).count() - 1) * sample_df.groupby(group_cols).std()**2
+  anova_table['SS']['Within Groups'] = SSE[var].sum()
+
+  # calculate SSTR and update anova table
+  SSTR = SSTR[var].sum() + SSE[var].sum()
+  anova_table['SS']['Total'] = SSTR
+
+  # update degree of freedom
+  anova_table['df']['Between Groups'] = sample_df['major'].nunique() - 1
+  anova_table['df']['Within Groups'] = sample_df.shape[0] - sample_df['major'].nunique()
+  anova_table['df']['Total'] = sample_df.shape[0] - 1
+
+  # calculate MS
+  anova_table['MS'] = anova_table['SS'] / anova_table['df']
+
+  # calculate F 
+  F = anova_table['MS']['Between Groups'] / anova_table['MS']['Within Groups']
+  anova_table['F']['Between Groups'] = F
+
+  # p-value
+  anova_table['P-value']['Between Groups'] = 1 - stats.f.cdf(F, anova_table['df']['Between Groups'], anova_table['df']['Within Groups'])
+
+  # F critical 
+  alpha = 0.05
+  # possible types "right-tailed, left-tailed, two-tailed"
+  tail_hypothesis_type = "two-tailed"
+  if tail_hypothesis_type == "two-tailed":
+      alpha /= 2
+  anova_table['F crit']['Between Groups'] = stats.f.ppf(1-alpha, anova_table['df']['Between Groups'], anova_table['df']['Within Groups'])
+  
+  # The p-value approach
+  print("Approach 1: The p-value approach to hypothesis testing in the decision rule")
+  conclusion = "Failed to reject the null hypothesis."
+  if anova_table['P-value']['Between Groups'] <= alpha:
+      conclusion = "Null Hypothesis is rejected."
+  print("F-score is:", anova_table['F']['Between Groups'], " and p value is:", anova_table['P-value']['Between Groups'])    
+  print(conclusion)
+
+  # The critical value approach
+  print("\n--------------------------------------------------------------------------------------")
+  print("Approach 2: The critical value approach to hypothesis testing in the decision rule")
+  conclusion = "Failed to reject the null hypothesis."
+  if anova_table['F']['Between Groups'] > anova_table['F crit']['Between Groups']:
+      conclusion = "Null Hypothesis is rejected."
+  print("F-score is:", anova_table['F']['Between Groups'], " and critical value is:", anova_table['F crit']['Between Groups'])
+  print(conclusion)
+
+def check_dif_between_week_days(this_df, channel_id, plot_charts=False):
+  """
+    Verifica se há diferença significativa entre os dias da semana
+  """
+  df_channel = this_df[this_df['channel_id'] == channel_id].copy()
+  
+  print()
+  print("---")
+  print(df_channel['channel_title'].max())
+  
+  week_dfs = {}
+  
+  print("Verificando distribuição normal. H0: é distribuição normal")
+  for n in df_channel['dia-da-semana'].unique():
+    week_dfs[n] = df_channel[df_channel['dia-da-semana'] == n].copy()
+    shapiro_result = shapiro_normal_distribution_test(week_dfs[n], 'views')
+    if shapiro_result.pvalue < 0.05:
+      print(n, "REJEITA H0")
+    else:
+      print(n, "Não rejeita H0")
+      
+    if plot_charts:
+      
+      plt.rcParams["figure.figsize"] = (50,10)
+
+      fig, ax = plt.subplots()
+
+      stats.probplot(week_dfs[n]['views'], dist="norm", plot=ax)
+      display(fig)
+      
+  print("Verificando razão entre maior e menor desvio-padrão. Precisam ser menores que 2")
+  ratio = min_max_std_ratio(this_df, 'views', ['dia-da-semana'])
+  print(ratio)
+  if ratio >= 2:
+    print("RAZÃO MAIOR QUE 2. RESULTADOS NÃO SÃO CONFIÁVEIS")
+    return
+  
+  anova(this_df, 'views', ['dia-da-semana'])
+
+def calculate_error(df_real, df_predict, var_col, include_adj_r_sqr=False):
+  """Dadas duas tabelas, uma com dados reais e outra com dados de previsão, calcula o erro entre elas
+  """
+  df_real['date_str'] = df_real['date'].astype(str)
+  df_predict['date_str'] = df_predict['date'].astype(str)
+  
+  df_merged = df_real.merge(df_predict, on=["date_str"], validate="1:1")
+  df_merged[f'error_{var_col}'] = df_merged.apply(lambda x: abs(x[f'{var_col}_x'] - x[f'{var_col}_y']), axis=1)
+  
+  df_merged[f'relative_error_{var_col}'] = df_merged.apply(
+    lambda x: x[f'error_{var_col}']/x[f'{var_col}_x'] if x[f'{var_col}_x'] is not pd.isna(x[f'{var_col}_x']) and x[f'{var_col}_x'] > 0 else None, axis=1)
+  
+  mean_error = df_merged[f'error_{var_col}'].mean()
+  mean_relative_error = df_merged[f'relative_error_{var_col}'].mean()
+  
+  if include_adj_r_sqr:
+    corr_matrix = np.corrcoef(df_merged[f'{var_col}_x'], df_merged[f'{var_col}_y'])
+    corr = corr_matrix[0,1]
+    r_sq = corr**2
+
+    n = df_merged.shape[0]
+    adjusted_r_sq = 1 - ((1 - r_sq)*(n - 1)/(n - 2))
+    
+    return mean_error, mean_relative_error, adjusted_r_sq
+  
+  return mean_error, mean_relative_error
+
+def calculate_adjusted_r_squared(df_real, df_predict, var_col):
+  """Dadas duas tabelas, uma com dados reais e outra com dados de previsão, calcula o r quadrado ajustado
+  """
+  df_real['date_str'] = df_real['date'].astype(str)
+  df_predict['date_str'] = df_predict['date'].astype(str)
+  
+  df_merged = df_real.merge(df_predict, on=["date_str"], validate="1:1")
+  
+  corr_matrix = numpy.corrcoef(df_merged[f'{var_col}_x'], df_merged[f'{var_col}_y'])
+  corr = corr_matrix[0,1]
+  r_sq = corr**2
+  
+  n = df_merged.shape[0]
+  adjusted_r_sq = 1 - ((1 - r_sq)*(n - 1)/(n - 2))
+  
+  return adjusted_r_sq
+
+def predict_using_prophet(this_df, channel_id, var_col, plot_charts=False, division_date='2022-03-31', return_dfs=False, var_values_always_positive=True):
+  df_channel = this_df[(this_df['channel_id'] == channel_id)].copy()
+  df_real = df_channel[(df_channel['date'].astype(str) > division_date)].filter(items=[var_col, 'date']).copy()
+  
+  m = Prophet()
+  m.fit(df_channel[df_channel['date'].astype(str) <= division_date].filter(items=['date', var_col]).rename(columns={'date': 'ds', var_col: 'y'}).copy())
+  
+  forecast = m.predict(m.make_future_dataframe(periods=df_real.shape[0]))
+  forecast = forecast[forecast['ds'].astype(str) > division_date].rename(columns={'ds': 'date', 'yhat': var_col}).filter(items=['date', var_col])
+  
+  if var_values_always_positive:
+    forecast[var_col] = forecast[var_col].apply(lambda x: 0 if x < 0 else x)
+  
+  if plot_charts:
+    plot_real_vs_predicted(df_real, forecast, var_col, title=df_channel['channel_title'].max())
+  
+  if return_dfs:
+    return df_real, forecast
+    
+  mean_error, relative_error = calculate_error(df_real, forecast, var_col)
+  print(f"PROPHET erro absoluto médio:", mean_error)
+  print(f"PROPHET erro relativo médio:", relative_error)
+
+def predict_using_mov_avg_per_day_of_week(this_df, channel_id, var_col, plot_charts=False, division_date='2022-03-31', window=4, print_results=True, plot_larger_real=False, return_dfs=False, return_all_errors=False):
+  df_channel = this_df[(this_df['channel_id'] == channel_id)].copy()
+  df_real = df_channel[(df_channel['date'].astype(str) > division_date)].copy()
+  
+  df_past = df_channel[df_channel['date'].astype(str) <= division_date]
+  
+  week_day_predictions = {}
+  
+  for week_day in this_df['dia-da-semana'].unique():
+    temp_df = df_past[df_past['dia-da-semana'] == week_day].sort_values(by=['date']).copy()
+    temp_df[f"{var_col}_mov_avg"] = temp_df[var_col].rolling(window=window, min_periods=window).mean()
+    week_day_predictions[week_day] = temp_df.tail(1)[f"{var_col}_mov_avg"].max()
+  
+  forecast = df_real.copy()
+  forecast[var_col] = None
+  
+  forecast[var_col] = forecast.apply(lambda x: week_day_predictions[x['dia-da-semana']], axis=1)
+  
+  if plot_charts:
+    if plot_larger_real:
+      plot_real_vs_predicted(df_channel, forecast, var_col, title=df_channel['channel_title'].max())
+    plot_real_vs_predicted(df_real, forecast, var_col, title=df_channel['channel_title'].max())
+  
+  if return_dfs:
+    return df_real, forecast
+    
+  mean_error, relative_error, adj_r_sqr = calculate_error(df_real, forecast, var_col, include_adj_r_sqr=True)
+  
+  if print_results:
+    print(f"MÉDIA MÓVEL erro absoluto médio:", mean_error)
+    print(f"MÉDIA MÓVEL erro relativo médio:", relative_error)
+    print(f"MÉDIA MÓVEL r quadrado ajustado:", adj_r_sqr)
+    
+  if return_all_errors:
+    return mean_error, relative_error, adj_r_sqr
+  
+  return relative_error
+
+def predict_using_mov_avg(this_df, channel_id, var_col, plot_charts=False, division_date='2022-03-31', window=4, print_results=True, plot_larger_real=False, return_dfs=False, return_all_errors=False):
+  df_channel = this_df[(this_df['channel_id'] == channel_id)].copy()
+  df_real = df_channel[(df_channel['date'].astype(str) > division_date)].copy()
+  
+  df_past = df_channel[df_channel['date'].astype(str) <= division_date]
+  
+  temp_df = df_past.sort_values(by=['date']).copy()
+  temp_df[f"{var_col}_mov_avg"] = temp_df[var_col].rolling(window=window, min_periods=window).mean()
+  prediction = temp_df.tail(1)[f"{var_col}_mov_avg"].max()
+  
+  forecast = df_real.copy()
+  forecast[var_col] = prediction
+  
+  if plot_charts:
+    if plot_larger_real:
+      plot_real_vs_predicted(df_channel, forecast, var_col, title=df_channel['channel_title'].max())
+    plot_real_vs_predicted(df_real, forecast, var_col, title=df_channel['channel_title'].max())
+  
+  if return_dfs:
+    return df_real, forecast
+    
+  mean_error, relative_error, adj_r_sqr = calculate_error(df_real, forecast, var_col, include_adj_r_sqr=True)
+  
+  if print_results:
+    print(f"MÉDIA MÓVEL erro absoluto médio:", mean_error)
+    print(f"MÉDIA MÓVEL erro relativo médio:", relative_error)
+    print(f"MÉDIA MÓVEL r quadrado ajustado:", adj_r_sqr)
+    
+  if return_all_errors:
+    return mean_error, relative_error, adj_r_sqr
+  
+  return relative_error
+
+def window_size_optimization(this_df, channel_id, var_col='views', first_window=3, last_window=10, fig=None, ax=None, use_days_of_week=True):
+  plot_dict = {
+    'channel': [],
+    'x': [],
+    'mean_error': [],
+    'relative_error': [],
+    'adj_r_sqr': []
+  }
+  
+  channel_title = this_df[this_df['channel_id'] == channel_id]['channel_title'].max()
+  
+  for i in range(first_window, last_window + 1):
+    print(f"window {i}")
+    plot_dict['channel'].append(channel_title)
+    plot_dict['x'].append(i)
+    if use_days_of_week:
+      mean_error, relative_error, adj_r_sqr = predict_using_mov_avg_per_day_of_week(this_df, channel_id, var_col, plot_charts=False,
+                                                                                    division_date='2022-03-31', window=i, print_results=False, return_all_errors=True)
+    else:
+      mean_error, relative_error, adj_r_sqr = predict_using_mov_avg(this_df, channel_id, var_col, plot_charts=False,
+                                                                    division_date='2022-03-31', window=i, print_results=False, return_all_errors=True)
+    plot_dict['mean_error'].append(mean_error)
+    plot_dict['relative_error'].append(relative_error)
+    plot_dict['adj_r_sqr'].append(adj_r_sqr)
+      
+  display_in_the_end = False
+  plt.rcParams["figure.figsize"] = (50,10)
+    
+  if fig is None or ax is None:
+    fig, ax = plt.subplots()
+    display_in_the_end = True
+    
+  ax.plot(plot_dict['x'], plot_dict['relative_error'], label='relative_error')
+  ax.plot(plot_dict['x'], plot_dict['adj_r_sqr'], label='adj_r_sqr')
+  ax.set_title(f"{channel_title}")
+  ax.legend()  
+  if display_in_the_end:
+    display(fig)
+    
+  return plot_dict
+
+
+def optimize_all(this_df, var_col='views', use_days_of_week=True):
+  new_df = pd.DataFrame()
+  
+  for channel_id in this_df['channel_id'].unique():
+    print("CANAL:", this_df[this_df['channel_id'] == channel_id]['channel_title'].max())
+    plot_dict = window_size_optimization(this_df, channel_id, var_col, first_window=1, last_window=10, fig=None, ax=None, use_days_of_week=use_days_of_week)
+    print()
+    new_df = pd.concat([new_df, pd.DataFrame(plot_dict)])
+  
+  display(new_df)
+  new_df = new_df.groupby(['x']).agg('mean').reset_index()
+  display(new_df)
+
+
+def predict_all(df, var_col='views', plot_charts=False):
+
+  data_dict = {
+    'model': [],
+    'channel': [],
+    'mean_error': [],
+    'mean_relative_error': [],
+    'adjusted_r_sq': []
+  }
+  for channel_id in df['channel_id'].unique():
+    this_df = df[df['channel_id'] == channel_id].copy()
+    channel_title = this_df['channel_title'].max()
+    print("CANAL:", channel_title, channel_id)
+    df_real, df_forecast = predict_using_mov_avg_per_day_of_week(this_df, channel_id, var_col, plot_charts=plot_charts, division_date='2022-03-31', window=3, plot_larger_real=False, return_dfs=True)
+    mean_error, mean_relative_error, adjusted_r_sq = calculate_error(df_real, df_forecast, var_col, include_adj_r_sqr=True)
+    print("mean_error, mean_relative_error, adjusted_r_sq", mean_error, mean_relative_error, adjusted_r_sq)
+    
+    data_dict['model'].append('mov_avg')
+    data_dict['channel'].append(channel_title)
+    data_dict['mean_error'].append(mean_error)
+    data_dict['mean_relative_error'].append(mean_relative_error)
+    data_dict['adjusted_r_sq'].append(adjusted_r_sq)
+    print()
+    
+    df_real, df_forecast = predict_using_prophet(this_df, channel_id, var_col, plot_charts=plot_charts, division_date='2022-03-31', return_dfs=True)
+    mean_error, mean_relative_error, adjusted_r_sq = calculate_error(df_real, df_forecast, var_col, include_adj_r_sqr=True)
+    print("mean_error, mean_relative_error, adjusted_r_sq", mean_error, mean_relative_error, adjusted_r_sq)
+    
+    data_dict['model'].append('prophet')
+    data_dict['channel'].append(channel_title)
+    data_dict['mean_error'].append(mean_error)
+    data_dict['mean_relative_error'].append(mean_relative_error)
+    data_dict['adjusted_r_sq'].append(adjusted_r_sq)
+    print()
+    
+  final_df = pd.DataFrame(data_dict)
+  display(final_df)
+  
+  return final_df
+
+
+---------------------------------------------------------------------------------------------------------------
+# Coleta de dados
+df = spark.sql(
+  f""" select a1.channel_id, a2.channel_title, a1.date, a1.views, a4.estimated_partner_revenue from
+    (select date, channel_id, sum(views) AS views
+        from gold.youtube_owner_basic
+        where date > '2020-12-31' and channel_id in (
+                'UCajU2T1qJEFblVLUzoXuDIA', -- Band Esporte Clube
+                'UC2qIiag94agLsvJGjkEV34Q', -- Esporte da Band
+                'UCZaOZdn-Y-I5ikrofkWBLgQ', -- Jogo Aberto
+                'UCjlcZ5YIXlBTaob0BkS_gDg', -- Os Donos da Bola
+                'UC896QaWKoSGdZTmy9rHyU_g' -- Show do Esporte
+                )
+        group by date, channel_id) a1
+     left join gold.youtube_dim_channels a2
+     on a1.channel_id = a2.channel_id
+     left join (
+         select date, channel_id, sum(ad_impressions) AS ad_impressions,
+           sum(estimated_partner_revenue) as estimated_partner_revenue,
+           avg(estimated_cpm) as estimated_cpm
+         from gold.youtube_estimated_revenue
+         group by date, channel_id) a4
+     on a1.channel_id = a4.channel_id and a1.date = a4.date
+  """).toPandas()
